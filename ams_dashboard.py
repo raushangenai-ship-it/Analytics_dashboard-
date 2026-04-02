@@ -291,6 +291,51 @@ def load(created_bytes, resolved_bytes):
 
 
 # ─────────────────────────────────────────────────────────
+#  TOWER MAPPING LOADER
+# ─────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def load_mapping(mapping_bytes):
+    """Load SNOW Queue → Tower mapping file."""
+    name = getattr(mapping_bytes, "name", "")
+    df = pd.read_csv(mapping_bytes) if name.endswith(".csv") else pd.read_excel(mapping_bytes)
+    df.columns = df.columns.str.strip()
+    # Normalise column names flexibly
+    col_map = {}
+    for c in df.columns:
+        cl = c.lower().strip()
+        if "queue" in cl or "snow" in cl or "assignment" in cl:
+            col_map[c] = "SNOW Queue Name"
+        elif "tower" in cl:
+            col_map[c] = "Tower"
+    df = df.rename(columns=col_map)
+    if "SNOW Queue Name" not in df.columns or "Tower" not in df.columns:
+        st.warning("Mapping file must have columns for Queue Name and Tower.")
+        return {}
+    return dict(zip(df["SNOW Queue Name"].str.strip(), df["Tower"].str.strip()))
+
+def apply_tower_mapping(df, mapping_dict):
+    """Add Tower column to dataframe using Assignment Group lookup."""
+    if not mapping_dict:
+        df["Tower"] = "Unmapped"
+        return df
+    df["Tower"] = df["Assignment Group"].map(mapping_dict).fillna("Unmapped")
+    return df
+
+TOWER_COLORS = {
+    "Collaboration":   "#0078b6",
+    "SAP":             "#d97706",
+    "Finance":         "#1a9e4e",
+    "Manufacturing":   "#7c3aed",
+    "Quality":         "#d62828",
+    "Integration":     "#0891b2",
+    "DBA":             "#374151",
+    "Legacy ERP":      "#92400e",
+    "BPCS":            "#be185d",
+    "Unmapped":        "#9ca3af",
+}
+
+
+# ─────────────────────────────────────────────────────────
 #  CHART FUNCTIONS
 # ─────────────────────────────────────────────────────────
 def fig_weekly_throughput(cr, re):
@@ -343,7 +388,8 @@ def fig_backlog_trend(cr):
     fig = go.Figure()
     fig.add_scatter(x=df["Date"], y=df["Backlog"],
                     fill="tozeroy", fillcolor="rgba(214,40,40,0.10)",
-                    line=dict(color="#d62828", width=2), name="Open Backlog")
+                    line=dict(color="#d62828", width=2), name="Cumulative Open Backlog",
+                    showlegend=True)
     return chart_style(fig, "Running Open Backlog Over Time", height=280)
 
 
@@ -404,10 +450,16 @@ def fig_avg_resolution_by_app(cr):
             .rename(columns={"Res Days": "Avg Days"})
             .sort_values("Avg Days", ascending=False).head(15))
     df["Avg Days"] = df["Avg Days"].round(1)
+    df["Speed"] = df["Avg Days"].apply(
+        lambda x: "Slow  >14d" if x > 14 else ("Medium 7-14d" if x > 7 else "Fast  ≤7d"))
     df["Color"] = df["Avg Days"].apply(
         lambda x: "#d62828" if x > 14 else ("#d97706" if x > 7 else "#1a9e4e"))
-    fig = px.bar(df, x="App", y="Avg Days", color="Color",
-                 color_discrete_map="identity",
+    fig = px.bar(df, x="App", y="Avg Days", color="Speed",
+                 color_discrete_map={
+                     "Fast  ≤7d": "#1a9e4e",
+                     "Medium 7-14d": "#d97706",
+                     "Slow  >14d": "#d62828"},
+                 category_orders={"Speed": ["Fast  ≤7d","Medium 7-14d","Slow  >14d"]},
                  text=df["Avg Days"].apply(lambda x: f"{x}d"))
     fig.update_traces(textposition="outside")
     fig.update_xaxes(tickangle=-35)
@@ -430,9 +482,9 @@ def fig_daily_trend(cr):
     daily["MA7"] = daily["Count"].rolling(7, min_periods=1).mean().round(1)
     fig = go.Figure()
     fig.add_bar(x=daily["Date"], y=daily["Count"],
-                name="Daily Count", marker_color=C_BLUE, opacity=0.55)
+                name="Daily Incident Count", marker_color=C_BLUE, opacity=0.55)
     fig.add_scatter(x=daily["Date"], y=daily["MA7"],
-                    name="7-day Avg", line=dict(color="#d62828", width=2.2), mode="lines")
+                    name="7-Day Rolling Avg", line=dict(color="#d62828", width=2.2), mode="lines")
     return chart_style(fig, "Daily Incident Volume + 7-day Rolling Average", height=300)
 
 
@@ -442,7 +494,8 @@ def fig_source_split(cr):
     src = src.sort_values("Created Week Ending")
     fig = px.bar(src, x="WLabel", y="Count", color="Source",
                  color_discrete_map={"Automated": C_TEAL, "Manual": C_NAVY},
-                 barmode="stack")
+                 barmode="stack",
+                 labels={"WLabel": "Week Ending", "Count": "Incidents", "Source": "Ticket Source"})
     return chart_style(fig, "Incident Source: Manual vs Automated (Weekly)", height=300)
 
 
@@ -468,7 +521,8 @@ def fig_sla_breach(cr):
         return None
     fig = px.bar(breached, x="Count", y="App", orientation="h",
                  color_discrete_sequence=["#d62828"], text="Count")
-    fig.update_traces(textposition="outside")
+    fig.update_traces(textposition="outside", name="Breached Incidents",
+                      showlegend=True)
     return chart_style(fig, "Applications with Most SLA-Breached Open Incidents", height=340)
 
 
@@ -486,6 +540,105 @@ def fig_opener_bar(cr):
                  text="Count")
     fig.update_traces(textposition="outside")
     return chart_style(fig, "Top Ticket Openers", height=380)
+
+
+def fig_tower_volume(cr):
+    """Bar chart: incident volume per tower, stacked open/closed."""
+    grp = (cr.groupby("Tower")
+             .agg(Total=("Number","count"), Open=("Is Open","sum"))
+             .reset_index())
+    grp["Closed"] = grp["Total"] - grp["Open"]
+    grp = grp.sort_values("Total", ascending=True)
+    colors = [TOWER_COLORS.get(t, "#9ca3af") for t in grp["Tower"]]
+    fig = go.Figure()
+    fig.add_bar(y=grp["Tower"], x=grp["Closed"], name="Resolved",
+                orientation="h",
+                marker=dict(color=[c for c in colors], opacity=0.6))
+    fig.add_bar(y=grp["Tower"], x=grp["Open"], name="Open",
+                orientation="h",
+                marker=dict(color=[c for c in colors], opacity=1.0))
+    fig.update_layout(barmode="stack", xaxis_title="Incidents",
+                      yaxis=dict(tickfont=dict(size=10)))
+    return chart_style(fig, "Incident Volume by Tower (Open vs Resolved)", height=380)
+
+
+def fig_tower_throughput(cr, re):
+    """Weekly throughput table grouped by Tower."""
+    if "Tower" not in cr.columns or "Tower" not in re.columns:
+        return None
+    cr_t = cr.groupby(["Created Week Ending","Tower"]).size().reset_index(name="Created")
+    re_t = re.groupby(["Resolved Week Ending","Tower"]).size().reset_index(name="Resolved")
+    cr_t = cr_t.rename(columns={"Created Week Ending":"Week"})
+    re_t = re_t.rename(columns={"Resolved Week Ending":"Week"})
+    merged = pd.merge(cr_t, re_t, on=["Week","Tower"], how="outer").fillna(0)
+    merged["Throughput"] = (merged["Resolved"]/merged["Created"].replace(0,np.nan)*100).round(1)
+    merged["WLabel"] = pd.to_datetime(merged["Week"]).dt.strftime("%-d %b")
+    merged = merged.sort_values(["Tower","Week"])
+    fig = px.line(merged, x="WLabel", y="Throughput", color="Tower",
+                  color_discrete_map=TOWER_COLORS, markers=True,
+                  line_shape="spline")
+    fig.add_hline(y=100, line_dash="dash", line_color="#d62828",
+                  annotation_text="100% target", annotation_position="bottom right")
+    fig.update_yaxes(title="Throughput %", range=[0, 160])
+    return chart_style(fig, "Weekly Throughput % by Tower", height=360)
+
+
+def fig_tower_ageing(open_df):
+    """Stacked bar: open ticket ageing by Tower."""
+    grp = (open_df.groupby(["Tower","Age Bucket"], observed=True)
+                  .size().reset_index(name="Count"))
+    piv = (grp.pivot(index="Tower", columns="Age Bucket", values="Count")
+              .fillna(0).reset_index())
+    piv["Total"] = piv[[c for c in AGE_ORDER if c in piv.columns]].sum(axis=1)
+    piv = piv.sort_values("Total", ascending=True)
+    fig = go.Figure()
+    for bucket, color in zip(AGE_ORDER, AGE_COLORS):
+        if bucket in piv.columns:
+            fig.add_bar(y=piv["Tower"], x=piv[bucket],
+                        name=bucket, orientation="h", marker_color=color)
+    fig.update_layout(barmode="stack", xaxis_title="Open Incidents",
+                      yaxis=dict(tickfont=dict(size=10)))
+    return chart_style(fig, "Open Incident Ageing by Tower", height=340)
+
+
+def fig_tower_resolution(cr):
+    """Box plot: resolution time distribution per tower."""
+    df = cr.dropna(subset=["Res Days"]).copy()
+    df = df[df["Res Days"] >= 0]
+    towers = df.groupby("Tower")["Res Days"].median().sort_values().index.tolist()
+    fig = go.Figure()
+    for t in towers:
+        sub = df[df["Tower"] == t]["Res Days"]
+        fig.add_box(y=sub, name=t,
+                    marker_color=TOWER_COLORS.get(t,"#9ca3af"),
+                    boxmean="sd", line_width=1.5)
+    cap = df["Res Days"].quantile(0.95) * 1.3
+    fig.update_yaxes(title="Days to Resolve", range=[0, min(cap, 80)])
+    return chart_style(fig, "Resolution Time by Tower", height=360)
+
+
+def fig_tower_sla(cr):
+    """SLA breach % per tower."""
+    df = cr[cr["Is Open"]].copy()
+    if df.empty or "Tower" not in df.columns:
+        return None
+    t = (df.groupby("Tower")
+           .agg(Total=("Number","count"), Breached=("SLA Breached","sum"))
+           .reset_index())
+    t["Breach %"] = (t["Breached"]/t["Total"]*100).round(1)
+    t["Color"] = t["Breach %"].apply(
+        lambda x: "#d62828" if x>30 else ("#d97706" if x>10 else "#1a9e4e"))
+    t = t.sort_values("Breach %", ascending=True)
+    t["Risk"] = t["Breach %"].apply(
+        lambda x: "High Risk >30%" if x > 30 else ("Medium Risk 10-30%" if x > 10 else "Low Risk ≤10%"))
+    risk_colors = {"High Risk >30%": "#d62828", "Medium Risk 10-30%": "#d97706", "Low Risk ≤10%": "#1a9e4e"}
+    fig = px.bar(t, x="Breach %", y="Tower", orientation="h",
+                 color="Risk",
+                 color_discrete_map=risk_colors,
+                 category_orders={"Risk": ["High Risk >30%","Medium Risk 10-30%","Low Risk ≤10%"]},
+                 text=t["Breach %"].apply(lambda x: f"{x}%"))
+    fig.update_traces(textposition="outside")
+    return chart_style(fig, "SLA Breach Rate % by Tower (Open Tickets)", height=320)
 
 
 # ─────────────────────────────────────────────────────────
@@ -515,12 +668,12 @@ def build_export(cr, re, tp_df):
                      .round(1).reset_index())
 
     open_export_cols = [c for c in
-        ["Number","App","Priority","Impact","Created On","Age Days",
+        ["Number","Tower","App","Priority","Impact","Created On","Age Days",
          "Age Bucket","SLA Breached","Assignment Group","Opened By"]
         if c in open_df.columns]
 
     sla_cols = [c for c in
-        ["Number","App","Priority","Created On","Age Days","Assignment Group"]
+        ["Number","Tower","App","Priority","Created On","Age Days","Assignment Group"]
         if c in sla_df.columns]
 
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -532,10 +685,79 @@ def build_export(cr, re, tp_df):
             w, sheet_name="Open Incidents", index=False)
         sla_df[sla_cols].to_excel(w, sheet_name="SLA Breached", index=False)
         app_summary.to_excel(w, sheet_name="App Summary", index=False)
+        if "Tower" in cr.columns:
+            tower_summary = (cr.groupby("Tower")
+                               .agg(Total=("Number","count"),
+                                    Open=("Is Open","sum"),
+                                    SLA_Breached=("SLA Breached","sum"),
+                                    Avg_Res_Days=("Res Days","mean"))
+                               .round(1).reset_index())
+            tower_summary["Closure Rate %"] = (
+                (tower_summary["Total"]-tower_summary["Open"])/tower_summary["Total"]*100
+            ).round(1)
+            tower_summary.to_excel(w, sheet_name="Tower Summary", index=False)
         cr.to_excel(w, sheet_name="All Created", index=False)
         re.to_excel(w, sheet_name="All Resolved", index=False)
     buf.seek(0)
     return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────
+#  ME MONTHLY DATA LOADER
+# ─────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def load_me_monthly(f):
+    """Parse the ME Monthly Deck Reporting Excel into a clean DataFrame."""
+    name = getattr(f, "name", "")
+    if name.endswith(".csv"):
+        raw = pd.read_csv(f, header=None)
+    else:
+        xl = pd.ExcelFile(f)
+        first_sheet = xl.sheet_names[0]
+        raw = xl.parse(first_sheet, header=None)
+
+    records = []
+    i = 4  # data rows start at row 4
+    while i < len(raw):
+        r0 = raw.iloc[i]
+        r1 = raw.iloc[i + 1] if i + 1 < len(raw) else None
+        r2 = raw.iloc[i + 2] if i + 2 < len(raw) else None
+
+        if pd.notna(r0.iloc[0]):
+            whitemark = r0.iloc[5] if pd.notna(r0.iloc[5]) else None
+            if whitemark is None and r2 is not None and pd.notna(r2.iloc[5]):
+                whitemark = r2.iloc[5]
+
+            sub_cat   = r1.iloc[1] if r1 is not None and pd.notna(r1.iloc[1]) else None
+            on_time_sub = r1.iloc[2] if r1 is not None else None
+            abt_sub   = r1.iloc[3] if r1 is not None else None
+            ibm_sub   = r1.iloc[4] if r1 is not None else None
+            pct_sub   = r1.iloc[6] if r1 is not None else None
+
+            records.append({
+                "Month":              pd.to_datetime(r0.iloc[0]),
+                "On Time":            r0.iloc[2],
+                "ABT Delay":          r0.iloc[3],
+                "IBM Delay":          r0.iloc[4],
+                "Whitemark":          whitemark,
+                "On Time All %":      r0.iloc[6],
+                "On Time Critical %": r0.iloc[7],
+                "Sub Category":       sub_cat,
+                "On Time Sub":        on_time_sub,
+                "ABT Delay Sub":      abt_sub,
+                "IBM Delay Sub":      ibm_sub,
+                "On Time Sub %":      pct_sub,
+            })
+        i += 3
+
+    df = pd.DataFrame(records)
+    df["Month"] = pd.to_datetime(df["Month"])
+    df["Total Changes"] = df["On Time"].fillna(0) + df["ABT Delay"].fillna(0) + df["IBM Delay"].fillna(0)
+    df["Year"]  = df["Month"].dt.year
+    df["MonthName"] = df["Month"].dt.strftime("%b %Y")
+    df["MonthShort"] = df["Month"].dt.strftime("%b")
+    df["Month Num"] = df["Month"].dt.month
+    return df.sort_values("Month").reset_index(drop=True)
 
 
 # ─────────────────────────────────────────────────────────
@@ -548,6 +770,14 @@ with st.sidebar:
         "Incident **Created** File", type=["csv","xlsx","xls"], key="cr")
     resolved_file = st.file_uploader(
         "Incident **Resolved** File", type=["csv","xlsx","xls"], key="re")
+    mapping_file  = st.file_uploader(
+        "Queue → Tower **Mapping** File *(optional)*",
+        type=["csv","xlsx","xls"], key="mf",
+        help="Upload the SNOW Queue vs Tower mapping Excel. If not uploaded, Tower filter will not be available.")
+    me_monthly_file = st.file_uploader(
+        "ME Monthly Deck Report *(optional)*",
+        type=["csv","xlsx","xls"], key="me",
+        help="Upload the ME Monthly Deck Reporting Excel for the Change On-Time tab.")
     st.markdown("---")
     st.caption("AMS Operations Dashboard v2.0")
 
@@ -555,6 +785,13 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────
 #  HEADER
 # ─────────────────────────────────────────────────────────
+# Tower pill for header
+sel_tow=""
+_tower_pill = (f'<span style="background:rgba(0,175,216,0.25);color:#b3e8f7;'
+               f'padding:0.18rem 0.7rem;border-radius:12px;font-size:0.72rem;'
+               f'font-weight:700;letter-spacing:0.06em;margin-right:0.4rem;">'
+               f'🏗 {sel_tow}</span>' if sel_tow != "All" else "")
+
 st.markdown(f"""
 <div class="ams-header">
   <div>
@@ -562,7 +799,7 @@ st.markdown(f"""
     <p>Abbott Application Management Support · ServiceNow Incident Analytics</p>
   </div>
   <div class="ams-right">
-    <span class="ams-badge">LIVE REPORT</span><br>
+    {_tower_pill}<span class="ams-badge">LIVE REPORT</span><br>
     <span class="ams-date">{TODAY.strftime('%A, %d %b %Y')}</span>
   </div>
 </div>
@@ -595,16 +832,42 @@ if not created_file or not resolved_file:
 with st.spinner("Processing ServiceNow data…"):
     cr_raw, re_raw = load(created_file, resolved_file)
 
+# ── Load tower mapping ──
+tower_map = {}
+if mapping_file:
+    tower_map = load_mapping(mapping_file)
+cr_raw = apply_tower_mapping(cr_raw, tower_map)
+re_raw = apply_tower_mapping(re_raw, tower_map)
+
 # ── Sidebar filters ──
 apps   = ["All"] + sorted(cr_raw["App"].dropna().unique())
 pris   = ["All"] + sorted(cr_raw["Priority"].dropna().unique(),
                            key=lambda x: {"High":0,"Moderate":1,"Low":2}.get(x,9))
 groups = ["All"] + sorted(cr_raw["Assignment Group"].dropna().unique())
+towers = ["All"] + sorted([t for t in cr_raw["Tower"].dropna().unique() if t != "Unmapped"]) + (
+    ["Unmapped"] if "Unmapped" in cr_raw["Tower"].values else [])
 min_d  = cr_raw["Created On"].min().date()
 max_d  = cr_raw["Created On"].max().date()
 
 with st.sidebar:
     st.markdown("### ⚙️ Filters")
+
+    # Tower — primary slice (most important)
+    if mapping_file:
+        st.markdown("""<div style="background:#0f3a5e;border-left:3px solid #00afd8;
+            border-radius:6px;padding:0.45rem 0.75rem;margin-bottom:0.6rem;">
+            <span style="color:#7eb8d8;font-size:0.68rem;font-weight:700;
+            text-transform:uppercase;letter-spacing:0.08em;">🏗 Tower</span>
+            </div>""", unsafe_allow_html=True)
+        sel_tow = st.selectbox("Tower", towers, key="f_tow")
+    else:
+        sel_tow = "All"
+        st.markdown("""<div style="background:#1e3348;border-radius:6px;
+            padding:0.5rem 0.75rem;margin-bottom:0.6rem;font-size:0.75rem;color:#7eb8d8;">
+            📌 Upload mapping file to enable Tower filter</div>""",
+            unsafe_allow_html=True)
+
+    st.markdown("---")
     sel_app   = st.selectbox("Application",      apps,   key="f_app")
     sel_pri   = st.selectbox("Priority",         pris,   key="f_pri")
     sel_grp   = st.selectbox("Assignment Group", groups, key="f_grp")
@@ -614,10 +877,27 @@ with st.sidebar:
                                key="f_date")
     show_auto = st.checkbox("Include Auto-created tickets", value=True, key="f_auto")
 
+    # Show active filter summary
+    active = [f for f in [
+        f"Tower: {sel_tow}" if sel_tow!="All" else "",
+        f"App: {sel_app}" if sel_app!="All" else "",
+        f"Priority: {sel_pri}" if sel_pri!="All" else "",
+        f"Group: {sel_grp[:20]}..." if sel_grp!="All" else "",
+    ] if f]
+    if active:
+        st.markdown("**Active filters:**")
+        for a in active:
+            st.markdown(f"<span style='background:#0f3a5e;color:#7eb8d8;padding:0.15rem 0.5rem;"
+                        f"border-radius:4px;font-size:0.73rem;display:inline-block;"
+                        f"margin:0.1rem 0'>{a}</span>", unsafe_allow_html=True)
+
 # ── Apply filters ──
 cr = cr_raw.copy()
 re = re_raw.copy()
 
+if sel_tow != "All":
+    cr = cr[cr["Tower"] == sel_tow]
+    re = re[re["Tower"] == sel_tow]
 if sel_app != "All":
     cr = cr[cr["App"] == sel_app]
     re = re[re["App"] == sel_app]
@@ -653,6 +933,7 @@ wow_delta = (len(cr[cr["WeekNum"] == wks[-1]]) -
              len(cr[cr["WeekNum"] == wks[-2]])) if len(wks) >= 2 else 0
 
 tp_class = "green" if pct_tp >= 100 else ("amber" if pct_tp >= 85 else "red")
+tower_ctx = f" &nbsp;·&nbsp; 🏗 Tower: <b>{sel_tow}</b>" if sel_tow != "All" else ""
 
 def delta_html(v, invert=False):
     if v == 0:
@@ -705,13 +986,14 @@ st.markdown(f"""
 #  TABS
 # ─────────────────────────────────────────────────────────
 (tab_action, tab_weekly, tab_age,
- tab_team, tab_trends, tab_drill, tab_export) = st.tabs([
+ tab_team, tab_trends, tab_drill, tab_me, tab_export) = st.tabs([
     "🚨 Action Required",
     "📅 Weekly Throughput",
     "⏳ Ageing & Backlog",
     "👥 Team & App Performance",
     "📈 Trends & Analytics",
     "🔍 Incident Drill-down",
+    "📋 ME Monthly Report",
     "⬇️ Export",
 ])
 
@@ -789,11 +1071,14 @@ with tab_action:
                     unsafe_allow_html=True)
         if not open_df.empty:
             age_cnt = open_df["Age Bucket"].value_counts().reindex(AGE_ORDER).fillna(0)
-            fig_aged = go.Figure(go.Bar(
-                x=age_cnt.index, y=age_cnt.values,
-                marker_color=AGE_COLORS,
-                text=age_cnt.values.astype(int),
-                textposition="outside"))
+            fig_aged = go.Figure()
+            for bucket, color in zip(AGE_ORDER, AGE_COLORS):
+                val = age_cnt.get(bucket, 0)
+                fig_aged.add_bar(
+                    x=[bucket], y=[val],
+                    name=bucket, marker_color=color,
+                    text=[int(val)], textposition="outside",
+                    showlegend=True)
             st.plotly_chart(chart_style(fig_aged, height=280),
                             use_container_width=True,
                             config={"displayModeBar": False},
@@ -882,6 +1167,13 @@ with tab_age:
     st.plotly_chart(fig_backlog_trend(cr), use_container_width=True,
                     config={"displayModeBar": False}, key="age_backlog")
 
+    if mapping_file:
+        st.markdown('<div class="sec">Open Incident Ageing by Tower</div>',
+                    unsafe_allow_html=True)
+        if not open_df.empty:
+            st.plotly_chart(fig_tower_ageing(open_df), use_container_width=True,
+                            config={"displayModeBar": False}, key="age_tower_bar")
+
     st.markdown('<div class="sec">Open Incident Ageing by Application</div>',
                 unsafe_allow_html=True)
     if open_df.empty:
@@ -910,6 +1202,50 @@ with tab_age:
 #  TAB 4 – TEAM & APP PERFORMANCE
 # ═══════════════════════════════════════════════
 with tab_team:
+    # ── Tower overview section (only when mapping loaded) ──
+    if mapping_file and sel_tow == "All":
+        st.markdown('<div class="sec">Tower-Level Overview</div>', unsafe_allow_html=True)
+        tow_c1, tow_c2 = st.columns(2)
+        with tow_c1:
+            st.plotly_chart(fig_tower_volume(cr), use_container_width=True,
+                            config={"displayModeBar": False}, key="tow_vol")
+        with tow_c2:
+            sf_tow = fig_tower_sla(cr)
+            if sf_tow:
+                st.plotly_chart(sf_tow, use_container_width=True,
+                                config={"displayModeBar": False}, key="tow_sla")
+
+        tow_c3, tow_c4 = st.columns(2)
+        with tow_c3:
+            st.plotly_chart(fig_tower_ageing(open_df), use_container_width=True,
+                            config={"displayModeBar": False}, key="tow_age")
+        with tow_c4:
+            st.plotly_chart(fig_tower_resolution(cr), use_container_width=True,
+                            config={"displayModeBar": False}, key="tow_res")
+
+        tp_tow = fig_tower_throughput(cr, re)
+        if tp_tow:
+            st.plotly_chart(tp_tow, use_container_width=True,
+                            config={"displayModeBar": False}, key="tow_tp")
+
+        # Tower summary table
+        st.markdown('<div class="sec">Tower Performance Summary</div>',
+                    unsafe_allow_html=True)
+        tow_sum = (cr.groupby("Tower")
+                     .agg(Total=("Number","count"),
+                          Open=("Is Open","sum"),
+                          SLA_Breached=("SLA Breached","sum"),
+                          Avg_Res_Days=("Res Days","mean"))
+                     .round(1).reset_index()
+                     .sort_values("Total", ascending=False))
+        tow_sum["Closure Rate %"] = (
+            (tow_sum["Total"]-tow_sum["Open"])/tow_sum["Total"]*100
+        ).round(1)
+        tow_sum["Open"] = tow_sum["Open"].astype(int)
+        tow_sum["SLA_Breached"] = tow_sum["SLA_Breached"].astype(int)
+        st.dataframe(tow_sum, use_container_width=True)
+        st.markdown("---")
+
     st.plotly_chart(fig_team_volume(cr), use_container_width=True,
                     config={"displayModeBar": False}, key="team_vol")
 
@@ -980,6 +1316,8 @@ with tab_trends:
                              color_discrete_map={
                                  "Critical":"#d62828","High":"#d97706",
                                  "Moderate":"#0078b6","Low":"#1a9e4e"},
+                             category_orders={"Impact": ["Critical","High","Moderate","Low"]},
+                             labels={"Count": "Incidents", "Impact": "Impact Level"},
                              text="Count")
             fig_imp.update_traces(textposition="outside")
             st.plotly_chart(chart_style(fig_imp, "Impact Distribution", height=280),
@@ -1022,7 +1360,7 @@ with tab_drill:
     st.caption(f"Showing **{len(drill_df):,}** incidents")
 
     show_cols = [c for c in
-        ["Number","App","Priority","Impact","Created On",
+        ["Number","Tower","App","Priority","Impact","Created On",
          "Age Days","Age Bucket","SLA Breached","Is Open",
          "Assignment Group","Opened By"]
         if c in drill_df.columns]
@@ -1045,6 +1383,401 @@ with tab_drill:
 # ═══════════════════════════════════════════════
 #  TAB 7 – EXPORT
 # ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════
+#  TAB ME – ME MONTHLY REPORT
+# ═══════════════════════════════════════════════
+with tab_me:
+    if not me_monthly_file:
+        st.markdown("""
+        <div style="text-align:center;padding:3rem 2rem;background:#f5f9fd;
+             border-radius:12px;border:2px dashed #b0cfe0;margin-top:1rem;">
+          <div style="font-size:2.5rem">📋</div>
+          <div style="font-size:1.1rem;font-weight:700;color:#003f6b;margin:0.5rem 0">
+            Upload ME Monthly Deck Report</div>
+          <div style="color:#5a7a94;font-size:0.85rem">
+            Use the sidebar to upload <b>ME_Monthly_Deck_Reporting.xlsx</b>
+            to enable the Change On-Time executive reporting tab.
+          </div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        with st.spinner("Parsing ME Monthly data…"):
+            me = load_me_monthly(me_monthly_file)
+
+        # ── Filters row ──────────────────────────────────────────────────
+        years_avail = sorted(me["Year"].unique())
+        mf1, mf2, mf3 = st.columns([2, 2, 3])
+        with mf1:
+            yr_opts = ["All Years"] + [str(y) for y in years_avail]
+            sel_yr = st.selectbox("Year", yr_opts, key="me_yr")
+        with mf2:
+            view_n = st.selectbox("Show Last N Months",
+                                  ["All", "12 Months", "24 Months", "36 Months"],
+                                  key="me_n")
+        with mf3:
+            sub_cats = ["All"] + sorted(me["Sub Category"].dropna().unique().tolist())
+            sel_sub = st.selectbox("Category Filter", sub_cats, key="me_sub")
+
+        me_f = me.copy()
+        if sel_yr != "All Years":
+            me_f = me_f[me_f["Year"] == int(sel_yr)]
+        if view_n == "12 Months":
+            me_f = me_f.tail(12)
+        elif view_n == "24 Months":
+            me_f = me_f.tail(24)
+        elif view_n == "36 Months":
+            me_f = me_f.tail(36)
+
+        # ── KPI strip ────────────────────────────────────────────────────
+        tot_changes   = int(me_f["Total Changes"].sum())
+        tot_ontime    = int(me_f["On Time"].fillna(0).sum())
+        tot_abt_delay = int(me_f["ABT Delay"].fillna(0).sum())
+        tot_ibm_delay = int(me_f["IBM Delay"].fillna(0).sum())
+        avg_monthly   = round(me_f["Total Changes"].mean(), 1)
+        pct_ontime    = round(tot_ontime / tot_changes * 100, 1) if tot_changes else 0
+        whitemark_val = me_f["Whitemark"].dropna().iloc[-1] if me_f["Whitemark"].notna().any() else "N/A"
+
+        st.markdown(f"""
+        <div class="kpi-row" style="grid-template-columns:repeat(5,1fr);">
+          <div class="kpi green">
+            <div class="kpi-label">Total Changes</div>
+            <div class="kpi-value">{tot_changes:,}</div>
+            <div class="kpi-delta"><span class="delta-neu">In selected period</span></div>
+          </div>
+          <div class="kpi green">
+            <div class="kpi-label">On Time</div>
+            <div class="kpi-value">{tot_ontime:,}</div>
+            <div class="kpi-delta"><span class="delta-dn">{pct_ontime}% on-time rate</span></div>
+          </div>
+          <div class="kpi {'red' if tot_abt_delay>0 else 'green'}">
+            <div class="kpi-label">ABT Delays</div>
+            <div class="kpi-value">{tot_abt_delay:,}</div>
+            <div class="kpi-delta"><span class="{'delta-up' if tot_abt_delay>0 else 'delta-dn'}">
+              Client-side delays</span></div>
+          </div>
+          <div class="kpi {'red' if tot_ibm_delay>0 else 'green'}">
+            <div class="kpi-label">IBM Delays</div>
+            <div class="kpi-value">{tot_ibm_delay:,}</div>
+            <div class="kpi-delta"><span class="{'delta-up' if tot_ibm_delay>0 else 'delta-dn'}">
+              Vendor delays</span></div>
+          </div>
+          <div class="kpi teal">
+            <div class="kpi-label">Avg / Month</div>
+            <div class="kpi-value">{avg_monthly}</div>
+            <div class="kpi-delta"><span class="delta-neu">Whitemark: {whitemark_val}</span></div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Chart 1: Monthly Change Volume (bar) + On-Time % (line) ──────
+        st.markdown('<div class="sec">Monthly Change Volume & On-Time Performance</div>',
+                    unsafe_allow_html=True)
+
+        fig_me_main = go.Figure()
+        fig_me_main.add_bar(x=me_f["MonthName"], y=me_f["On Time"],
+                            name="✅ On Time", marker_color="#1a9e4e", opacity=0.88)
+        fig_me_main.add_bar(x=me_f["MonthName"], y=me_f["ABT Delay"],
+                            name="⚠️ ABT Delay (Client)", marker_color="#d97706", opacity=0.9)
+        fig_me_main.add_bar(x=me_f["MonthName"], y=me_f["IBM Delay"],
+                            name="🔴 IBM Delay (Vendor)", marker_color="#d62828", opacity=0.9)
+        fig_me_main.add_scatter(
+            x=me_f["MonthName"], y=me_f["On Time All %"],
+            name="On Time All %", yaxis="y2", mode="lines+markers",
+            line=dict(color=C_BLUE, width=2.5),
+            marker=dict(size=6, color=C_BLUE))
+        fig_me_main.add_scatter(
+            x=me_f["MonthName"], y=me_f["On Time Critical %"],
+            name="On Time Critical %", yaxis="y2", mode="lines+markers",
+            line=dict(color="#7c3aed", width=2, dash="dot"),
+            marker=dict(size=5, color="#7c3aed"))
+        # Whitemark reference line + legend entry
+        if me_f["Whitemark"].notna().any():
+            wm = me_f["Whitemark"].dropna().iloc[-1]
+            fig_me_main.add_hline(y=wm, line_dash="dash",
+                                  line_color="#9b1d20", line_width=1.5)
+            # Dummy scatter so Whitemark appears in the legend
+            fig_me_main.add_scatter(
+                x=[None], y=[None], mode="lines",
+                name=f"── Whitemark ({wm})",
+                line=dict(color="#9b1d20", width=2, dash="dash"),
+                yaxis="y2", showlegend=True)
+        fig_me_main.update_layout(
+            barmode="stack",
+            yaxis=dict(title="Number of Changes", gridcolor="#dde8f0"),
+            yaxis2=dict(title="On-Time %", overlaying="y", side="right",
+                        showgrid=False, range=[0, 115]),
+            xaxis=dict(tickangle=-40, gridcolor="#dde8f0"),
+            height=440,
+            margin=dict(l=8, r=8, t=60, b=8),
+            paper_bgcolor="white", plot_bgcolor="#f5f9fd",
+            font=dict(family="IBM Plex Sans", size=11, color="#3a4a5c"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                        xanchor="right", x=1, font=dict(size=10),
+                        title=dict(text="", font=dict(size=10))),
+        )
+        st.plotly_chart(fig_me_main, use_container_width=True,
+                        config={"displayModeBar": False}, key="me_main")
+
+        # ── Charts row 2 ──────────────────────────────────────────────────
+        mc1, mc2 = st.columns(2)
+
+        with mc1:
+            st.markdown('<div class="sec">Annual Change Volume (Year-over-Year)</div>',
+                        unsafe_allow_html=True)
+            yr_grp = (me_f.groupby("Year")
+                          .agg(Total=("Total Changes","sum"),
+                               OnTime=("On Time","sum"),
+                               ABT=("ABT Delay","sum"),
+                               IBM=("IBM Delay","sum"),
+                               Months=("Month","count"))
+                          .reset_index())
+            yr_grp["Avg/Month"] = (yr_grp["Total"] / yr_grp["Months"]).round(1)
+            fig_yr = go.Figure()
+            fig_yr.add_bar(x=yr_grp["Year"].astype(str), y=yr_grp["OnTime"],
+                           name="✅ On Time", marker_color="#1a9e4e", opacity=0.88)
+            fig_yr.add_bar(x=yr_grp["Year"].astype(str), y=yr_grp["ABT"],
+                           name="⚠️ ABT Delay", marker_color="#d97706")
+            fig_yr.add_bar(x=yr_grp["Year"].astype(str), y=yr_grp["IBM"],
+                           name="🔴 IBM Delay", marker_color="#d62828")
+            fig_yr.add_scatter(x=yr_grp["Year"].astype(str), y=yr_grp["Avg/Month"],
+                               name="📈 Avg/Month", yaxis="y2", mode="lines+markers",
+                               line=dict(color=C_BLUE, width=2),
+                               marker=dict(size=7, color=C_BLUE))
+            fig_yr.update_layout(
+                barmode="stack",
+                yaxis=dict(title="Total Changes"),
+                yaxis2=dict(title="Avg per Month", overlaying="y", side="right",
+                            showgrid=False),
+                height=340, margin=dict(l=8,r=8,t=20,b=8),
+                paper_bgcolor="white", plot_bgcolor="#f5f9fd",
+                font=dict(family="IBM Plex Sans", size=11, color="#3a4a5c"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                            xanchor="right", x=1, font=dict(size=10)),
+            )
+            st.plotly_chart(fig_yr, use_container_width=True,
+                            config={"displayModeBar": False}, key="me_yoy")
+
+        with mc2:
+            st.markdown('<div class="sec">Monthly Seasonality — Avg Changes by Calendar Month</div>',
+                        unsafe_allow_html=True)
+            season = (me_f.groupby("Month Num")["Total Changes"].mean().reset_index())
+            month_labels = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",
+                            7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
+            season["Month Label"] = season["Month Num"].map(month_labels)
+            # Bucket each month into volume tiers for a named legend
+            q_lo = season["Total Changes"].quantile(0.33)
+            q_hi = season["Total Changes"].quantile(0.67)
+            def _vol_tier(v):
+                if v >= q_hi: return "High Volume"
+                elif v >= q_lo: return "Medium Volume"
+                return "Low Volume"
+            season["Volume"] = season["Total Changes"].apply(_vol_tier)
+            vol_colors = {"Low Volume": "#b3d9f0", "Medium Volume": C_BLUE,
+                          "High Volume": C_NAVY}
+            vol_order  = ["Low Volume", "Medium Volume", "High Volume"]
+            fig_sea = px.bar(season, x="Month Label", y="Total Changes",
+                             color="Volume",
+                             color_discrete_map=vol_colors,
+                             category_orders={"Volume": vol_order,
+                                              "Month Label": list(month_labels.values())},
+                             labels={"Total Changes": "Avg Monthly Changes",
+                                     "Month Label": "Calendar Month",
+                                     "Volume": "Volume Tier"},
+                             text=season["Total Changes"].round(1))
+            fig_sea.update_traces(textposition="outside", texttemplate="%{text:.1f}")
+            fig_sea.update_layout(
+                height=340, margin=dict(l=8,r=8,t=55,b=8),
+                paper_bgcolor="white", plot_bgcolor="#f5f9fd",
+                font=dict(family="IBM Plex Sans", size=11, color="#3a4a5c"),
+                xaxis=dict(gridcolor="#dde8f0"),
+                yaxis=dict(title="Avg Changes", gridcolor="#dde8f0"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                            xanchor="right", x=1, font=dict(size=10),
+                            title=dict(text="Volume Tier", font=dict(size=10))),
+                showlegend=True,
+            )
+            st.plotly_chart(fig_sea, use_container_width=True,
+                            config={"displayModeBar": False}, key="me_season")
+
+        # ── Charts row 3: Delay analysis + Sub-category ───────────────────
+        mc3, mc4 = st.columns(2)
+
+        with mc3:
+            st.markdown('<div class="sec">Delay Root-Cause — ABT vs IBM (Monthly)</div>',
+                        unsafe_allow_html=True)
+            delay_df = me_f[(me_f["ABT Delay"] > 0) | (me_f["IBM Delay"] > 0)].copy()
+            if delay_df.empty:
+                st.markdown("""
+                <div class="alert-ok">
+                  <div class="alert-title">✅ Zero Delays in Selected Period</div>
+                  <div class="alert-body">No ABT or IBM delays recorded.</div>
+                </div>""", unsafe_allow_html=True)
+            else:
+                fig_delay = go.Figure()
+                fig_delay.add_bar(x=delay_df["MonthName"], y=delay_df["ABT Delay"],
+                                  name="ABT Delay (Client-side)", marker_color="#d97706")
+                fig_delay.add_bar(x=delay_df["MonthName"], y=delay_df["IBM Delay"],
+                                  name="IBM Delay (Vendor-side)", marker_color="#d62828")
+                fig_delay.update_layout(
+                    barmode="group",
+                    height=300, margin=dict(l=8,r=8,t=20,b=8),
+                    paper_bgcolor="white", plot_bgcolor="#f5f9fd",
+                    font=dict(family="IBM Plex Sans", size=11, color="#3a4a5c"),
+                    xaxis=dict(tickangle=-35, gridcolor="#dde8f0"),
+                    yaxis=dict(title="Delay Count", gridcolor="#dde8f0"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                xanchor="right", x=1, font=dict(size=10)),
+                )
+                st.plotly_chart(fig_delay, use_container_width=True,
+                                config={"displayModeBar": False}, key="me_delay")
+
+        with mc4:
+            st.markdown('<div class="sec">Critical / High Sub-Category On-Time %</div>',
+                        unsafe_allow_html=True)
+            sub_df = me_f[me_f["On Time Sub %"].notna()].copy()
+            if sub_df.empty:
+                st.info("No sub-category data available in selected period.")
+            else:
+                sub_pivot = sub_df[["MonthName","Sub Category","On Time Sub","On Time Sub %"]].copy()
+                color_map = {"Critical": "#d62828", "High": "#d97706"}
+                fig_sub = go.Figure()
+                for cat in sub_pivot["Sub Category"].dropna().unique():
+                    cat_df = sub_pivot[sub_pivot["Sub Category"] == cat]
+                    fig_sub.add_scatter(
+                        x=cat_df["MonthName"], y=cat_df["On Time Sub %"],
+                        name=f"{cat} On-Time %",
+                        mode="lines+markers",
+                        line=dict(color=color_map.get(cat, C_BLUE), width=2),
+                        marker=dict(size=6))
+                fig_sub.add_hline(y=100, line_dash="dash", line_color="#1a9e4e",
+                                  line_width=1.5)
+                # Dummy scatter so the target line appears in the legend
+                fig_sub.add_scatter(
+                    x=[None], y=[None], mode="lines",
+                    name="── 100% Target",
+                    line=dict(color="#1a9e4e", width=2, dash="dash"),
+                    showlegend=True)
+                fig_sub.update_layout(
+                    height=300, margin=dict(l=8,r=8,t=20,b=8),
+                    paper_bgcolor="white", plot_bgcolor="#f5f9fd",
+                    font=dict(family="IBM Plex Sans", size=11, color="#3a4a5c"),
+                    xaxis=dict(tickangle=-35, gridcolor="#dde8f0"),
+                    yaxis=dict(title="On-Time %", range=[0, 115], gridcolor="#dde8f0"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                xanchor="right", x=1, font=dict(size=10)),
+                )
+                st.plotly_chart(fig_sub, use_container_width=True,
+                                config={"displayModeBar": False}, key="me_sub_pct")
+
+        # ── Monthly Summary Table (matches %On Time sheet format) ─────────
+        st.markdown('<div class="sec">Monthly Summary Table — Last 12 Months</div>',
+                    unsafe_allow_html=True)
+        tbl = me_f.tail(12)[["MonthName","On Time","ABT Delay","IBM Delay",
+                               "Total Changes","On Time All %","On Time Critical %"]].copy()
+        tbl.columns = ["Month","On Time","ABT Delay","IBM Delay",
+                       "Total","On Time All %","On Time Critical %"]
+
+        def pct_badge(v):
+            if pd.isna(v): return "—"
+            cls = "bg-g" if v >= 100 else ("bg-y" if v >= 90 else "bg-r")
+            return f'<span class="badge {cls}">{v:.0f}%</span>'
+
+        rows_html = []
+        for _, r in tbl.iterrows():
+            abt_style = ' style="color:#d97706;font-weight:700"' if r["ABT Delay"] > 0 else ''
+            ibm_style = ' style="color:#d62828;font-weight:700"' if r["IBM Delay"] > 0 else ''
+            rows_html.append(f"""<tr>
+              <td>{r['Month']}</td>
+              <td>{int(r['On Time']) if pd.notna(r['On Time']) else '—'}</td>
+              <td{abt_style}>{int(r['ABT Delay']) if pd.notna(r['ABT Delay']) else '—'}</td>
+              <td{ibm_style}>{int(r['IBM Delay']) if pd.notna(r['IBM Delay']) else '—'}</td>
+              <td><b>{int(r['Total']) if pd.notna(r['Total']) else '—'}</b></td>
+              <td>{pct_badge(r['On Time All %'])}</td>
+              <td>{pct_badge(r['On Time Critical %'])}</td>
+            </tr>""")
+
+        # Totals
+        s = tbl.sum(numeric_only=True)
+        tp_all  = round(tbl['On Time All %'].mean(), 1) if len(tbl) else 0
+        tp_crit = round(tbl['On Time Critical %'].mean(), 1) if len(tbl) else 0
+        rows_html.append(f"""<tr>
+          <td><b>TOTAL / AVG</b></td>
+          <td><b>{int(s['On Time'])}</b></td>
+          <td><b>{int(s['ABT Delay'])}</b></td>
+          <td><b>{int(s['IBM Delay'])}</b></td>
+          <td><b>{int(s['Total'])}</b></td>
+          <td>{pct_badge(tp_all)}</td>
+          <td>{pct_badge(tp_crit)}</td>
+        </tr>""")
+
+        st.markdown(f"""
+        <table class="tp-table">
+          <thead><tr>
+            <th>Month</th><th>On Time</th><th>ABT Delay</th>
+            <th>IBM Delay</th><th>Total</th>
+            <th>On Time All %</th><th>On Time Critical %</th>
+          </tr></thead>
+          <tbody>{"".join(rows_html)}</tbody>
+        </table>""", unsafe_allow_html=True)
+
+        # ── Rolling 12-month avg trend ─────────────────────────────────────
+        st.markdown('<div class="sec">12-Month Rolling Average — Change Volume</div>',
+                    unsafe_allow_html=True)
+        roll = me.copy()
+        roll["Rolling Avg"] = roll["Total Changes"].rolling(12, min_periods=3).mean().round(1)
+        roll["Rolling Max"] = roll["Total Changes"].rolling(12, min_periods=3).max()
+        roll["Rolling Min"] = roll["Total Changes"].rolling(12, min_periods=3).min()
+        fig_roll = go.Figure()
+        fig_roll.add_scatter(x=roll["MonthName"], y=roll["Rolling Max"],
+                             fill=None, mode="lines",
+                             line=dict(color="rgba(0,120,182,0.1)", width=0),
+                             showlegend=False)
+        fig_roll.add_scatter(x=roll["MonthName"], y=roll["Rolling Min"],
+                             fill="tonexty", mode="lines",
+                             line=dict(color="rgba(0,120,182,0.1)", width=0),
+                             fillcolor="rgba(0,120,182,0.08)",
+                             name="12-mo Min/Max Range", showlegend=True)
+        fig_roll.add_bar(x=roll["MonthName"], y=roll["Total Changes"],
+                         name="Monthly Total Changes", marker_color=C_TEAL, opacity=0.5)
+        fig_roll.add_scatter(x=roll["MonthName"], y=roll["Rolling Avg"],
+                             name="12-mo Rolling Average", mode="lines",
+                             line=dict(color=C_NAVY, width=2.5))
+        fig_roll.update_layout(
+            height=300, margin=dict(l=8,r=8,t=20,b=8),
+            paper_bgcolor="white", plot_bgcolor="#f5f9fd",
+            font=dict(family="IBM Plex Sans", size=11, color="#3a4a5c"),
+            xaxis=dict(tickangle=-40, gridcolor="#dde8f0",
+                       tickmode="array",
+                       tickvals=roll["MonthName"].iloc[::6].tolist()),
+            yaxis=dict(title="Changes", gridcolor="#dde8f0"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                        xanchor="right", x=1, font=dict(size=10)),
+            barmode="overlay",
+        )
+        st.plotly_chart(fig_roll, use_container_width=True,
+                        config={"displayModeBar": False}, key="me_rolling")
+
+        # ── Raw data expander ─────────────────────────────────────────────
+        with st.expander("🔍 View Raw ME Monthly Data"):
+            st.dataframe(
+                me_f[["MonthName","On Time","ABT Delay","IBM Delay",
+                       "Total Changes","On Time All %","On Time Critical %",
+                       "Sub Category","On Time Sub","On Time Sub %","Whitemark"]]
+                .rename(columns={"MonthName":"Month"}),
+                use_container_width=True, height=380)
+
+        # ── Download ME data ──────────────────────────────────────────────
+        me_buf = io.BytesIO()
+        me_f.to_excel(me_buf, index=False, sheet_name="ME Monthly")
+        me_buf.seek(0)
+        st.download_button(
+            "⬇️ Download ME Monthly Data (.xlsx)",
+            data=me_buf.getvalue(),
+            file_name=f"ME_Monthly_Report_{TODAY.strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="me_dl"
+        )
+
+
 with tab_export:
     st.markdown('<div class="sec">Export Full AMS Report to Excel</div>',
                 unsafe_allow_html=True)
@@ -1058,6 +1791,7 @@ with tab_export:
 | **Open Ageing** | Open backlog pivot — App × Age bucket |
 | **Open Incidents** | Full open list with age, SLA status, priority |
 | **SLA Breached** | Tickets that breached priority-based SLA targets |
+| **Tower Summary** | Per-tower KPIs: volume, open, SLA breached, avg resolution, closure rate |
 | **App Summary** | Per-app KPIs: volume, open, SLA breached, avg resolution |
 | **All Created** | Full raw created dataset with computed fields |
 | **All Resolved** | Full raw resolved dataset |
